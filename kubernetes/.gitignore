@@ -1,0 +1,5 @@
+vault_aws_keys.yml
+vault_secrets_smtp.yml
+*.retry
+hosts*
+keys/*

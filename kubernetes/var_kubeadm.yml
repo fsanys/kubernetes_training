@@ -1,0 +1,11 @@
+---
+# HOSTS
+# Only work with one Master node
+nodes:
+  node1:
+    master: true
+    worker: false
+  node2:
+    master: false
+    worker: true
+

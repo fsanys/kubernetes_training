@@ -1,0 +1,278 @@
+- hosts: localhost
+  connection: local
+  gather_facts: False
+  vars:
+    email_address: fsanys@palo-it.com
+    name: fsanys
+    aws_access_key: "{{ aws_access_key }}"
+    aws_secret_key: "{{ aws_secret_key }}"
+    instance_type: t2.medium
+    security_group: flask_group
+    image: ami-0c5199d385b432989
+    aws_region: ap-southeast-1
+  vars_files:
+   - vault_aws_keys.yml
+   - var_kubeadm.yml
+  tasks:
+   - name: Clean-up host file
+     file:
+       state: absent
+       path: "./hosts_{{name}}"
+
+   - name: Clean-up host file
+     file:
+       state: absent
+       path: "./keys/key_{{ name }}.pem"
+
+
+   - name: Clean-up host file
+     file:
+       state: absent
+       path: "./keys/key_{{ name }}.ppk"
+
+
+   - name: delete current ec2 key pair, if the key already exists
+     ec2_key:
+       region: "{{ aws_region }}"
+       aws_access_key: "{{ aws_access_key }}"
+       aws_secret_key: "{{ aws_secret_key }}"
+       name: "key_{{ name }}"
+       state: absent
+     register: ec2_key_deletion
+
+   - name: create a new ec2 key pair, returns generated private key
+     ec2_key:
+       region: "{{ aws_region }}"
+       aws_access_key: "{{ aws_access_key }}"
+       aws_secret_key: "{{ aws_secret_key }}"
+       name: "key_{{ name }}"
+       force: True
+     register: ec2_key_creation
+
+   - name: Save Private Key
+     copy: content="{{ ec2_key_creation.key.private_key }}" dest="keys/key_{{name}}.pem" mode=0600
+     when: ec2_key_creation.changed
+
+   - name: Convert Key to ppk
+     command: 'yum -y install putty'
+     become: true
+
+   - name: Create a ppk file
+     command: 'puttygen keys/key_{{name}}.pem -o keys/key_{{name}}.ppk -O private'
+     become: true
+
+
+
+   - name: Add IP address of all hosts to all hosts
+     blockinfile:
+       path: "./hosts_{{name}}"
+       create: yes
+       marker: ""
+       block: |
+          [master]
+
+          [worker]
+
+   - name: Create Security Group
+     ec2_group:
+       name: "{{ security_group }}_{{ name }}"
+       description: The webservers security group
+       region: "{{ aws_region }}"
+       aws_access_key: "{{ aws_access_key }}"
+       aws_secret_key: "{{ aws_secret_key }}"
+       rules:
+       - proto: tcp
+         from_port: 22
+         to_port: 22
+         cidr_ip: 0.0.0.0/0
+       - proto: tcp
+         from_port: 80
+         to_port: 80
+         cidr_ip: 0.0.0.0/0
+       - proto: tcp
+         from_port: 443
+         to_port: 443
+         cidr_ip: 0.0.0.0/0
+       - proto: tcp
+         from_port: 6443
+         to_port: 6443
+         cidr_ip: 0.0.0.0/0
+       - proto: tcp
+         from_port: 10250
+         to_port: 10252
+         cidr_ip: 0.0.0.0/0
+       - proto: tcp
+         from_port: 2379
+         to_port: 2380
+         cidr_ip: 0.0.0.0/0
+       - proto: tcp
+         from_port: 30000
+         to_port: 32767
+         cidr_ip: 0.0.0.0/0
+       rules_egress:
+       - proto: all
+         cidr_ip: 0.0.0.0/0
+
+   - name: Include task list in play
+     include: incl01_kubeadm.yml
+     with_dict: "{{ nodes }}"
+     vars:
+       node: "{{ item }}"
+
+
+- hosts: master:worker
+  become: true
+  tasks:
+    - name: Disable SWAP
+      shell: swapoff -a
+
+    - name: Update all packages
+      apt:
+        name: "*"
+        state: latest
+        force_apt_get: true
+
+    - name: Add docker registry
+      shell: curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+      register: details
+
+    - name: Add docker registry 2
+      shell: sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu  $(lsb_release -cs)  stable"
+      register: details2
+
+    - name: Add kubernetes registry
+      shell: curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+
+    - name: test apt_repo
+      apt_repository:
+        repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+        state: present
+
+    - name: Update all packages
+      apt:
+        name: "*"
+        state: latest
+        force_apt_get: true
+
+    - name: Install docker-ce
+      apt:
+        name:
+        - docker-ce=18.06.1~ce~3-0~ubuntu
+        - kubelet=1.12.2-00
+        - kubeadm=1.12.2-00
+        - kubectl=1.12.2-00
+        state: present
+        force_apt_get: true
+
+    - name: Enable service docker-ce
+      systemd:
+        enabled: yes
+        masked: no
+        name: docker
+
+    - name: Make sure a service is running
+      systemd:
+        state: started
+        name: docker
+
+
+- hosts: master
+  vars:
+    email_address: fsanys@palo-it.com
+    name: fsanys
+  tasks:
+    - name: KUBEADM init
+      shell: "sudo kubeadm init --pod-network-cidr=10.244.1.0/16"
+      register: details
+
+    - debug: var=details
+     
+    - name: Try shell
+      shell: "sudo kubeadm token create --print-join-command"
+      register: output_join
+    
+    - debug: var=output_join
+
+    - name: Create .kube
+      shell: "mkdir -p $HOME/.kube"
+
+    - name: Copy kubectl conf inside kubernetes config
+      shell: "sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config"
+
+    - name: Change ownership of the folder
+      shell: "sudo chown $(id -u):$(id -g) $HOME/.kube/config"
+
+    - name: Installation of Flannel
+      shell: "kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/bc79dd1505b0c8681ece4de4c0d86c5cd2643275/Documentation/kube-flannel.yml"
+
+    - name: Try shell
+      shell: "sudo kubeadm token create --print-join-command"
+      register: output_kubeadm
+
+  #- name: test
+  #  shell: "echo command= > ./var_test.yml"
+  #    #echo "{{output_join.stdout_lines}}" >> ./var_test.yml"
+  #  delegate_to: localhost
+
+    - name: test 2
+      shell: "echo command: {{output_kubeadm.stdout}} > ./var_join_kubeadm_{{name}}.yml"
+      delegate_to: localhost
+
+
+- hosts: worker
+  vars:
+    email_address: fsanys@palo-it.com
+    name: fsanys
+  vars_files:
+  - var_join_kubeadm_{{name}}.yml
+  tasks:
+  - name: test shell
+    shell: "sudo {{command}}"
+    register: test
+
+
+  - debug: var=test
+
+
+
+- hosts: localhost
+  connection: local
+  gather_facts: False
+  vars:
+    email_address: fsanys@palo-it.com
+    name: fsanys
+  vars_files:
+  - var_join_kubeadm_{{name}}.yml
+  - vault_secrets_smtp.yml
+  tasks:
+   - name: Send email notification
+     mail:
+       host: smtp.gmail.com
+       port: 465
+       username: sg-notification@palo-it.com
+       password: "{{ mail_password }}"
+       to: "{{ email_address }}"
+       subject: Kubernetes Training - Your Kubernetes cluster
+       attach:
+         - "./keys/key_{{name}}.pem"
+         - "./keys/key_{{name}}.ppk"
+         - "./hosts_{{name}}"
+       body: |
+         Hello,
+         Please find the details of the virtual machine created for the Kubernetes training (Docker image)
+         Private Key: Enclosed
+
+         You can get the IP of your master server in the host file: hosts_{{name}}
+         How to Connect:
+           * MAC/LINUX:
+             1- Download the pem file and change the permission of the file (400)
+             2- Ssh using the key: ssh -i key_{{name}}.pem ubuntu@IP_master_server
+           * Windows:
+             1- Download the ppk file 
+             2- If you don't already have Putty manager, download it.
+             3- Open putty manager and update the hostname with ubuntu@IP_master_server
+             4- Change the parameter SSH -> Key -> Browse and load the ppk file downloaded in the step 1
+             5- Connect to the instance by clicking "Open"
+     become: true
+
+ 
